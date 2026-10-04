@@ -97,10 +97,14 @@ class BDMemoria(BD):
     def incidentes_por_categoria_semana(self, desde=None, hasta=None):
         cuenta: Dict[Tuple[str, str], int] = {}
         for d in self.datos["incidentes"]:
-            f = d["fecha"]
+            f = d.get("fecha")
+            if not isinstance(f, datetime):
+                continue
             if (desde and f < desde) or (hasta and f > hasta):
                 continue
-            clave = (_semana_iso(f), d["clasificacion"]["categoria"])
+            clasificacion = d.get("clasificacion") or {}
+            categoria = clasificacion.get("categoria", "Sin categoría")
+            clave = (_semana_iso(f), categoria)
             cuenta[clave] = cuenta.get(clave, 0) + 1
         return [{"semana": s, "categoria": c, "total": t}
                 for (s, c), t in sorted(cuenta.items(), key=lambda kv: (kv[0][0], -kv[1]))]

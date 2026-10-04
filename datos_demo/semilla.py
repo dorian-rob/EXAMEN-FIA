@@ -32,11 +32,34 @@ def cargar_datos_demostracion():
             "tipo_carga": "Peligrosa"
         }
     ]
+    riesgos_demo = [
+        {
+            "modulo": "IA Clasificadora",
+            "descripcion": "Extracción errónea de entidades",
+            "probabilidad_inicial": 4,
+            "impacto_inicial": 4,
+            "mitigacion": "Validación Pydantic y reglas de respaldo",
+            "probabilidad_residual": 2,
+            "impacto_residual": 2,
+        },
+        {
+            "modulo": "Control de acceso",
+            "descripcion": "Decisión incorrecta ante fallo de datos",
+            "probabilidad_inicial": 3,
+            "impacto_inicial": 5,
+            "mitigacion": "Evaluación determinista y revisión operativa",
+            "probabilidad_residual": 1,
+            "impacto_residual": 3,
+        },
+    ]
 
     try:
         if db.conectado:
             for c in camiones_demo:
                 db.insertar("camiones", c)
+            if db.contar("riesgos_eticos") == 0:
+                for riesgo in riesgos_demo:
+                    db.insertar("riesgos_eticos", {**riesgo, "creado_en": ahora()})
             log.info("✅ Base de datos poblada exitosamente!")
         else:
             log.error("No se pudo conectar a MongoDB: %s", db.error)

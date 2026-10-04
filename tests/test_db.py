@@ -56,6 +56,40 @@ class TestBDSinConexion(unittest.TestCase):
         db = BD({**CONFIG_DEFECTO, "mongo_uri": "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=300"})
         self.assertFalse(db.conectar())
         self.assertTrue(db.error)
+        self.assertIsNone(db.cliente)
+        self.assertIsNone(db.db)
+
+    def test_agregacion_usa_fecha_escalar_y_tolera_resultado_incompleto(self):
+        class ColeccionIncidentes:
+            pipeline = None
+
+            def aggregate(self, pipeline):
+                self.pipeline = pipeline
+                return [{
+                    "_id": {"anio": None, "semana": None, "categoria": "Derrame"},
+                    "total": 1,
+                }]
+
+        class BaseFalsa:
+            def __init__(self):
+                self.incidentes = ColeccionIncidentes()
+
+            def __getitem__(self, nombre):
+                if nombre != "incidentes":
+                    raise KeyError(nombre)
+                return self.incidentes
+
+        db = BD(dict(CONFIG_DEFECTO))
+        db.db = BaseFalsa()
+
+        resultados = db.incidentes_por_categoria_semana()
+
+        self.assertEqual(resultados[0]["semana"], "Sin fecha")
+        filtro = db.db.incidentes.pipeline[0]["$match"]
+        self.assertEqual(
+            filtro["$expr"],
+            {"$eq": [{"$type": "$fecha"}, "date"]},
+        )
 
 
 class TestDocumentos(unittest.TestCase):

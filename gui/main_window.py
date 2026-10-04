@@ -1,34 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Interfaz gráfica principal del sistema LogiSmart."""
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
-
-from config import cargar_config
-from db.conexion import BD
-from db.memoria import BDMemoria
-from reglas.motor import evaluar_reglas
-from clasificador.hibrido import ClasificadorHibrido
-from asistente.chat_rag import AsistenteRAG
-from riesgos.matriz import EvaluadorRiesgos
-
-
-class VentanaPrincipal:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("LogiSmart - Sistema Modular de Gestión Logística")
-        self.root.geometry("950x700")
-# -*- coding: utf-8 -*-
 """Interfaz de escritorio LogiSmart con tema nocturno de Halloween."""
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+from pathlib import Path
 
 from asistente.chat_rag import AsistenteRAG
 from clasificador.hibrido import ClasificadorHibrido
 from config import cargar_config, guardar_config
 from db.conexion import BD
 from db.memoria import BDMemoria
+from reportes import exportar_csv, exportar_json, exportar_pdf
 from reglas.motor import evaluar_reglas
 from riesgos.matriz import EvaluadorRiesgos
+from utils import ahora, log
 
 
 COLORES = {
@@ -45,6 +29,7 @@ class VentanaPrincipal:
         "clasificador": ("Clasificador de Correos", "Incidentes etiquetados con IA y reglas de respaldo"),
         "asistente": ("Asistente Chat", "Consulta a Ollama con contexto de LogiSmart"),
         "riesgos": ("Matriz de Riesgos", "Seguimiento de exposición y mitigaciones"),
+        "reportes": ("Reportes", "Exporta bitácoras, análisis y alertas ejecutivas"),
         "configuracion": ("Configuración", "Conexiones y preferencias del sistema"),
     }
 
@@ -57,7 +42,8 @@ class VentanaPrincipal:
         self.cfg = cargar_config()
         self.modo_memoria = getattr(root, "usar_memoria", False)
         self.db = self._crear_db()
-        self.db.conectar()
+        if not self.db.conectar():
+            log.error("No se pudo conectar a MongoDB al iniciar: %s", self.db.error)
         self.clasificador = ClasificadorHibrido()
         self.asistente = AsistenteRAG(self.db)
         self.evaluador_riesgos = EvaluadorRiesgos()
@@ -107,6 +93,7 @@ class VentanaPrincipal:
             "clasificador": self._crear_vista_clasificador,
             "asistente": self._crear_vista_asistente,
             "riesgos": self._crear_vista_riesgos,
+            "reportes": self._crear_vista_reportes,
             "configuracion": self._crear_vista_configuracion,
         }
         for clave, crear in builders.items():
@@ -150,7 +137,8 @@ class VentanaPrincipal:
         tk.Label(sidebar, text="ESPACIO DE TRABAJO", bg=COLORES["fondo"], fg=COLORES["suave"],
                  font=("Segoe UI", 8, "bold")).grid(row=0, column=0, sticky="w", padx=22, pady=(24, 13))
         items = [("acceso", "⌂", "Control de Acceso"), ("clasificador", "✉", "Clasificador de Correos"),
-                 ("asistente", "☾", "Asistente Chat (RAG)"), ("riesgos", "⚗", "Matriz de Riesgos")]
+                 ("asistente", "☾", "Asistente Chat (RAG)"), ("riesgos", "⚗", "Matriz de Riesgos"),
+                 ("reportes", "▤", "Reportes")]
         for fila, (clave, icono, texto) in enumerate(items, start=1):
             boton = tk.Button(sidebar, text=f"  {icono}     {texto}", anchor="w", relief="flat", bd=0,
                               bg=COLORES["fondo"], fg=COLORES["suave"], activebackground=COLORES["panel"],
@@ -232,6 +220,8 @@ class VentanaPrincipal:
         self.lbl_titulo_vista.config(text=nombre)
         self.lbl_subtitulo_vista.config(text=subtitulo)
         self.vistas[clave].tkraise()
+        if clave == "riesgos" and hasattr(self, "tabla_riesgos"):
+            self._cargar_tabla_riesgos()
         for nav, boton in self.botones_nav.items():
             seleccionado = nav == clave
             boton.config(bg=COLORES["panel"] if seleccionado else COLORES["fondo"],
@@ -244,9 +234,15 @@ class VentanaPrincipal:
                 self.kpi_valores[clave].config(text=str(self.db.contar(coleccion)))
             except Exception:
                 self.kpi_valores[clave].config(text="—")
-        riesgos = self._datos_riesgos()
-        puntaje = max((r["probabilidad_inicial"] * r["impacto_inicial"] for r in riesgos), default=0)
-        self.kpi_valores["riesgo"].config(text=f"{puntaje} / 25")
+        try:
+            riesgos = self._datos_riesgos()
+            puntaje = max((r["puntaje_inicial"] for r in riesgos), default=0)
+            self.kpi_valores["riesgo"].config(text=f"{puntaje} / 25")
+        except Exception as exc:
+            log.exception("No se pudieron cargar los riesgos para el indicador")
+            self.kpi_valores["riesgo"].config(text="—")
+            if hasattr(self, "lbl_estado_riesgos"):
+                self.lbl_estado_riesgos.config(text=f"No se pudieron cargar riesgos: {exc}")
 
     def _crear_vista_acceso(self, vista):
         vista.grid_columnconfigure(0, weight=3)
@@ -305,11 +301,28 @@ class VentanaPrincipal:
         self.txt_explicacion_acceso.insert("end", f"{nombre}\nPremisas: P={p}, Q={q}, R={r}, S={s}\n\n")
         self.txt_explicacion_acceso.insert("end", "\n".join(resultado["explicacion"]))
         self.txt_explicacion_acceso.configure(state="disabled")
+        momento = ahora()
         try:
-            self.db.insertar("accesos", {"placa": placa, "decision": resultado["decision"],
-                                         "premisas": {"P": p, "Q": q, "R": r, "S": s}})
-        except Exception:
-            pass
+            self.db.insertar("accesos", {
+                "fecha": momento,
+                "placa": placa,
+                "camion_id": (
+                    camion.get("camion_id", camion.get("_id")) if camion else None
+                ),
+                "decision": resultado["decision"],
+                "premisas": {"P": p, "Q": q, "R": r, "S": s},
+                "empresa": camion.get("empresa") if camion else None,
+                "tipo_carga": camion.get("tipo_carga") if camion else None,
+                "documentos_incompletos": r,
+                "certificacion_valida": s,
+                "autorizacion": p,
+                "lista_negra": q,
+                "timestamp_entrada": (
+                    momento if resultado["decision"] != "DENEGADO" else None
+                ),
+            })
+        except Exception as exc:
+            messagebox.showerror("Registro de acceso", str(exc))
         self._actualizar_kpis()
 
     def _crear_vista_clasificador(self, vista):
@@ -341,9 +354,21 @@ class VentanaPrincipal:
             return
         resultado = self.clasificador.clasificar_correo(texto)
         try:
-            self.db.insertar("incidentes", {"correo": texto, "resultado": resultado})
-        except Exception:
-            pass
+            cfg_ollama = {
+                clave: self.clasificador.cfg[clave]
+                for clave in ("ollama_host", "modelo", "modo_clasificacion", "reintentos", "timeout_llm")
+                if clave in self.clasificador.cfg
+            }
+            self.db.insertar("incidentes", {
+                "fecha": ahora(),
+                "correo": texto,
+                "correo_original": texto,
+                "resultado": resultado,
+                "clasificacion": resultado,
+                "configuracion_ollama": cfg_ollama,
+            })
+        except Exception as exc:
+            messagebox.showerror("Registro de incidente", str(exc))
         for widget in self.lbl_badges_incidente.winfo_children():
             widget.destroy()
         prioridad = resultado.get("prioridad", "Baja")
@@ -411,9 +436,27 @@ class VentanaPrincipal:
     def _crear_vista_riesgos(self, vista):
         panel = self._panel(vista)
         panel.grid(row=0, column=0, sticky="nsew")
-        panel.grid_rowconfigure(1, weight=1)
+        panel.grid_rowconfigure(2, weight=1)
         panel.grid_columnconfigure(0, weight=1)
         self._encabezado_panel(panel, "Registro de riesgos", "Matriz 5 × 5 · mitigación y exposición residual", "⚗")
+        acciones = tk.Frame(panel, bg=COLORES["panel"])
+        acciones.pack(fill="x", padx=16, pady=(0, 10))
+        self._boton(acciones, "Nuevo riesgo", self._nuevo_riesgo).pack(side="left", padx=(0, 8))
+        self._boton(acciones, "Editar seleccionado", self._editar_riesgo, primario=False).pack(
+            side="left", padx=(0, 8)
+        )
+        self._boton(acciones, "Eliminar seleccionado", self._eliminar_riesgo, primario=False).pack(
+            side="left"
+        )
+        self.lbl_estado_riesgos = tk.Label(
+            panel,
+            text="",
+            bg=COLORES["panel"],
+            fg=COLORES["suave"],
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        self.lbl_estado_riesgos.pack(fill="x", padx=18, pady=(0, 8))
         columnas = ("modulo", "descripcion", "inicial", "mitigacion", "residual")
         titulos = ("Módulo", "Descripción", "Nivel inicial", "Mitigación", "Nivel residual")
         self.tabla_riesgos = self._crear_tabla(panel, columnas, titulos)
@@ -432,29 +475,253 @@ class VentanaPrincipal:
         return tabla
 
     def _datos_riesgos(self):
-        return [
-            {"modulo": "IA Clasificadora", "descripcion": "Extracción errónea de entidades",
-             "probabilidad_inicial": 4, "impacto_inicial": 4,
-             "mitigacion": "Validación Pydantic y reglas de respaldo",
-             "probabilidad_residual": 2, "impacto_residual": 2},
-            {"modulo": "Control de acceso", "descripcion": "Decisión incorrecta ante fallo de datos",
-             "probabilidad_inicial": 3, "impacto_inicial": 5,
-             "mitigacion": "Evaluación determinista y revisión operativa",
-             "probabilidad_residual": 1, "impacto_residual": 3},
-        ]
+        riesgos = self.db.listar("riesgos_eticos")
+        return [self.evaluador_riesgos.procesar_riesgo(riesgo) for riesgo in riesgos]
 
     def _cargar_tabla_riesgos(self):
         self.tabla_riesgos.delete(*self.tabla_riesgos.get_children())
-        for riesgo in self._datos_riesgos():
-            procesado = self.evaluador_riesgos.procesar_riesgo(riesgo)
+        try:
+            riesgos = self._datos_riesgos()
+        except Exception as exc:
+            log.exception("No se pudo cargar la matriz de riesgos")
+            self.lbl_estado_riesgos.config(
+                text=f"No se pudieron cargar riesgos. Revisa la conexión a MongoDB: {exc}",
+                fg=COLORES["rojo"],
+            )
+            return
+        if not riesgos:
+            self.lbl_estado_riesgos.config(
+                text="No hay riesgos registrados. Usa «Nuevo riesgo» para agregar el primero.",
+                fg=COLORES["amarillo"],
+            )
+            return
+        self.lbl_estado_riesgos.config(
+            text=f"{len(riesgos)} riesgo(s) cargado(s) desde riesgos_eticos.",
+            fg=COLORES["verde"],
+        )
+        for procesado in riesgos:
             nivel = procesado["nivel_inicial"].lower()
             tag = "critico" if nivel == "crítico" else nivel if nivel in ("alto", "medio") else ""
             icono = "🧙" if nivel in ("alto", "crítico") else "🧪"
-            self.tabla_riesgos.insert("", "end", values=(
-                procesado["modulo"], procesado["descripcion"],
-                f"{icono} {procesado['nivel_inicial']} · {procesado['puntaje_inicial']}/25",
-                procesado["mitigacion"], f"{procesado['nivel_residual']} · {procesado['puntaje_residual']}/25",
-            ), tags=(tag,))
+            self.tabla_riesgos.insert(
+                "",
+                "end",
+                iid=str(procesado["_id"]),
+                values=(
+                    procesado.get("modulo", "—"),
+                    procesado.get("descripcion", "—"),
+                    f"{icono} {procesado['nivel_inicial']} · {procesado['puntaje_inicial']}/25",
+                    procesado.get("mitigacion", "—"),
+                    f"{procesado['nivel_residual']} · {procesado['puntaje_residual']}/25",
+                ),
+                tags=(tag,),
+            )
+
+    def _formulario_riesgo(self, riesgo=None):
+        editar = riesgo is not None
+        ventana = tk.Toplevel(self.root)
+        ventana.title("Editar riesgo" if editar else "Nuevo riesgo")
+        ventana.configure(bg=COLORES["panel"])
+        ventana.transient(self.root)
+        ventana.grab_set()
+        ventana.resizable(False, False)
+        ventana.grid_columnconfigure(1, weight=1)
+
+        campos_texto = (
+            ("modulo", "Módulo"),
+            ("descripcion", "Descripción"),
+            ("mitigacion", "Mitigación"),
+        )
+        entradas = {}
+        for fila, (clave, etiqueta) in enumerate(campos_texto):
+            tk.Label(
+                ventana,
+                text=etiqueta,
+                bg=COLORES["panel"],
+                fg=COLORES["texto"],
+                font=("Segoe UI", 9),
+            ).grid(row=fila, column=0, sticky="w", padx=14, pady=7)
+            entrada = tk.Entry(
+                ventana,
+                bg=COLORES["entrada"],
+                fg=COLORES["texto"],
+                insertbackground=COLORES["naranja"],
+                relief="flat",
+                width=48,
+            )
+            entrada.grid(row=fila, column=1, sticky="ew", padx=14, pady=7, ipady=6)
+            entrada.insert(0, str((riesgo or {}).get(clave, "")))
+            entradas[clave] = entrada
+
+        campos_puntaje = (
+            ("probabilidad_inicial", "Probabilidad inicial"),
+            ("impacto_inicial", "Impacto inicial"),
+            ("probabilidad_residual", "Probabilidad residual"),
+            ("impacto_residual", "Impacto residual"),
+        )
+        for indice, (clave, etiqueta) in enumerate(campos_puntaje, start=len(campos_texto)):
+            tk.Label(
+                ventana,
+                text=etiqueta,
+                bg=COLORES["panel"],
+                fg=COLORES["texto"],
+                font=("Segoe UI", 9),
+            ).grid(row=indice, column=0, sticky="w", padx=14, pady=7)
+            selector = ttk.Combobox(ventana, values=("1", "2", "3", "4", "5"), state="readonly", width=8)
+            selector.grid(row=indice, column=1, sticky="w", padx=14, pady=7)
+            valor = (riesgo or {}).get(clave, 1)
+            selector.set(str(valor))
+            entradas[clave] = selector
+
+        def guardar():
+            cambios = {
+                clave: entrada.get().strip()
+                for clave, entrada in entradas.items()
+                if clave in {"modulo", "descripcion", "mitigacion"}
+            }
+            if any(not valor for valor in cambios.values()):
+                messagebox.showwarning(
+                    "Matriz de riesgos",
+                    "Completa el módulo, la descripción y la mitigación.",
+                    parent=ventana,
+                )
+                return
+            cambios.update({
+                clave: int(entradas[clave].get())
+                for clave, _etiqueta in campos_puntaje
+            })
+            try:
+                self.evaluador_riesgos.procesar_riesgo(cambios)
+                if editar:
+                    if not self.db.actualizar("riesgos_eticos", str(riesgo["_id"]), cambios=cambios):
+                        raise ValueError("El riesgo ya no existe en la base de datos.")
+                else:
+                    cambios["creado_en"] = ahora()
+                    self.db.insertar("riesgos_eticos", cambios)
+            except Exception as exc:
+                log.exception("No se pudo guardar el riesgo")
+                messagebox.showerror("Matriz de riesgos", str(exc), parent=ventana)
+                return
+            ventana.destroy()
+            self._cargar_tabla_riesgos()
+            self._actualizar_kpis()
+
+        botones = tk.Frame(ventana, bg=COLORES["panel"])
+        botones.grid(row=len(campos_texto) + len(campos_puntaje), column=0, columnspan=2, pady=14)
+        self._boton(botones, "Guardar", guardar).pack(side="left", padx=6)
+        self._boton(botones, "Cancelar", ventana.destroy, primario=False).pack(side="left", padx=6)
+        ventana.wait_window()
+
+    def _nuevo_riesgo(self):
+        self._formulario_riesgo()
+
+    def _riesgo_seleccionado(self):
+        seleccion = self.tabla_riesgos.selection()
+        if not seleccion:
+            messagebox.showwarning("Matriz de riesgos", "Selecciona un riesgo de la tabla.")
+            return None
+        try:
+            riesgo = self.db.obtener("riesgos_eticos", seleccion[0])
+        except Exception as exc:
+            log.exception("No se pudo leer el riesgo seleccionado")
+            messagebox.showerror("Matriz de riesgos", str(exc))
+            return None
+        if riesgo is None:
+            messagebox.showerror("Matriz de riesgos", "El riesgo seleccionado ya no existe.")
+        return riesgo
+
+    def _editar_riesgo(self):
+        riesgo = self._riesgo_seleccionado()
+        if riesgo is not None:
+            self._formulario_riesgo(riesgo)
+
+    def _eliminar_riesgo(self):
+        riesgo = self._riesgo_seleccionado()
+        if riesgo is None:
+            return
+        if not messagebox.askyesno(
+            "Eliminar riesgo",
+            f"¿Eliminar el riesgo «{riesgo.get('modulo', 'sin módulo')}»?",
+        ):
+            return
+        try:
+            if not self.db.eliminar("riesgos_eticos", str(riesgo["_id"])):
+                raise ValueError("El riesgo ya no existe en la base de datos.")
+        except Exception as exc:
+            log.exception("No se pudo eliminar el riesgo")
+            messagebox.showerror("Matriz de riesgos", str(exc))
+            return
+        self._cargar_tabla_riesgos()
+        self._actualizar_kpis()
+
+    def _crear_vista_reportes(self, vista):
+        panel = self._panel(vista)
+        panel.grid(row=0, column=0, sticky="nsew")
+        self._encabezado_panel(
+            panel,
+            "Exportar reportes",
+            "Selecciona un formato y elige dónde guardar el archivo.",
+            "▤",
+        )
+        opciones = (
+            (
+                "Bitácora de accesos · CSV",
+                "Camiones, permisos, estatus documental y marcas de tiempo.",
+                "csv",
+                exportar_csv,
+            ),
+            (
+                "Análisis y riesgos · JSON",
+                "Incidentes, evaluaciones LLM y riesgos éticos en estructura completa.",
+                "json",
+                exportar_json,
+            ),
+            (
+                "Informe ejecutivo · PDF",
+                "Resumen ISO semanal y alertas críticas con puntaje desde 17.",
+                "pdf",
+                exportar_pdf,
+            ),
+        )
+        for titulo, detalle, extension, exportador in opciones:
+            fila = tk.Frame(panel, bg=COLORES["panel"])
+            fila.pack(fill="x", padx=20, pady=9)
+            texto = tk.Frame(fila, bg=COLORES["panel"])
+            texto.pack(side="left", fill="x", expand=True, padx=(0, 12))
+            tk.Label(
+                texto, text=titulo, bg=COLORES["panel"], fg=COLORES["texto"],
+                font=("Segoe UI Semibold", 10), anchor="w",
+            ).pack(fill="x")
+            tk.Label(
+                texto, text=detalle, bg=COLORES["panel"], fg=COLORES["suave"],
+                font=("Segoe UI", 9), anchor="w", wraplength=600, justify="left",
+            ).pack(fill="x", pady=(4, 0))
+            self._boton(
+                fila,
+                f"Exportar .{extension}",
+                lambda ext=extension, func=exportador: self._exportar_reporte(ext, func),
+            ).pack(side="right")
+
+    def _exportar_reporte(self, extension, exportador):
+        ruta = filedialog.asksaveasfilename(
+            title=f"Guardar reporte {extension.upper()}",
+            initialdir=Path(__file__).resolve().parents[1] / "reportes",
+            initialfile=f"reporte_logismart.{extension}",
+            defaultextension=f".{extension}",
+            filetypes=[(f"Archivo {extension.upper()}", f"*.{extension}")],
+        )
+        if not ruta:
+            return
+        try:
+            total = exportador(self.db, ruta)
+        except Exception as exc:
+            log.exception("No se pudo exportar el reporte %s", extension.upper())
+            messagebox.showerror("Error al exportar", str(exc))
+            return
+        messagebox.showinfo(
+            "Reporte exportado",
+            f"Archivo guardado correctamente.\nRegistros incluidos: {total}",
+        )
 
     def _actualizar_tabla_camiones(self):
         self.tabla_camiones.delete(*self.tabla_camiones.get_children())
@@ -481,7 +748,9 @@ class VentanaPrincipal:
             bloque.grid(row=fila, column=0, sticky="ew", pady=(0, 13))
             entrada.insert(0, str(self.cfg.get(clave, "")))
             self.config_campos[clave] = entrada
-        self.lbl_config_estado = tk.Label(panel, text="", bg=COLORES["panel"], fg=COLORES["suave"],
+        estado_db = self.db.error if not self.db.conectado else ""
+        self.lbl_config_estado = tk.Label(panel, text=estado_db, bg=COLORES["panel"],
+                                          fg=COLORES["rojo"] if estado_db else COLORES["suave"],
                                           font=("Segoe UI", 9), anchor="w")
         self.lbl_config_estado.pack(fill="x", padx=20, pady=(0, 10))
         self._boton(panel, "Guardar y reconectar   →", self._guardar_configuracion).pack(

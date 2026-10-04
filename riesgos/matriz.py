@@ -21,12 +21,12 @@ class EvaluadorRiesgos:
 
     def procesar_riesgo(self, riesgo: dict) -> dict:
         """Calcula el puntaje inicial, el nivel de severidad y el riesgo residual."""
-        p_init = riesgo.get("probabilidad_inicial", 1)
-        i_init = riesgo.get("impacto_inicial", 1)
+        p_init = self._validar_valor(riesgo, "probabilidad_inicial")
+        i_init = self._validar_valor(riesgo, "impacto_inicial")
         puntaje_inicial = p_init * i_init
 
-        p_res = riesgo.get("probabilidad_residual", 1)
-        i_res = riesgo.get("impacto_residual", 1)
+        p_res = self._validar_valor(riesgo, "probabilidad_residual")
+        i_res = self._validar_valor(riesgo, "impacto_residual")
         puntaje_residual = p_res * i_res
 
         riesgo_procesado = dict(riesgo)
@@ -36,3 +36,10 @@ class EvaluadorRiesgos:
         riesgo_procesado["nivel_residual"] = self.calcular_nivel(puntaje_residual)
 
         return riesgo_procesado
+
+    @staticmethod
+    def _validar_valor(riesgo: dict, campo: str) -> int:
+        valor = riesgo.get(campo)
+        if isinstance(valor, bool) or not isinstance(valor, int) or not 1 <= valor <= 5:
+            raise ValueError(f"{campo} debe ser un número entero entre 1 y 5.")
+        return valor

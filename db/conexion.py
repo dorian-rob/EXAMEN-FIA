@@ -73,7 +73,7 @@ class BD:
             self.error = None
             return True
         except Exception as exc:
-            self.db = None
+            self.cerrar()
             self.error = f"No se pudo conectar a MongoDB: {exc}"
             return False
 
@@ -157,18 +157,24 @@ class BD:
         hasta: Optional[datetime] = None
     ) -> List[Dict[str, Any]]:
         """AGREGACIÓN: incidentes por categoría y semana ISO."""
-        pipeline: List[Dict[str, Any]] = []
-        rango = {
-            k: v for k, v in (("$gte", desde), ("$lte", hasta)) if v is not None
+        filtro: Dict[str, Any] = {
+            "$expr": {"$eq": [{"$type": "$fecha"}, "date"]}
         }
+        rango = {k: v for k, v in (("$gte", desde), ("$lte", hasta)) if v is not None}
         if rango:
-            pipeline.append({"$match": {"fecha": rango}})
+            filtro["fecha"] = rango
 
-        pipeline += [
+        pipeline: List[Dict[str, Any]] = [
+            {"$match": filtro},
             {
                 "$group": {
                     "_id": {
-                        "categoria": "$clasificacion.categoria",
+                        "categoria": {
+                            "$ifNull": [
+                                "$clasificacion.categoria",
+                                {"$ifNull": ["$resultado.categoria", "Sin categoría"]},
+                            ]
+                        },
                         "anio": {"$isoWeekYear": "$fecha"},
                         "semana": {"$isoWeek": "$fecha"}
                     },
@@ -180,7 +186,12 @@ class BD:
 
         resultados = []
         for r in self.db["incidentes"].aggregate(pipeline):
-            semana_fmt = f"{r['_id']['anio']}-W{r['_id']['semana']:02d}"
+            anio, semana = r["_id"]["anio"], r["_id"]["semana"]
+            semana_fmt = (
+                f"{anio}-W{semana:02d}"
+                if isinstance(anio, int) and isinstance(semana, int)
+                else "Sin fecha"
+            )
             resultados.append({
                 "semana": semana_fmt,
                 "categoria": r["_id"]["categoria"],
